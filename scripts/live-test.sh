@@ -17,10 +17,13 @@ keepassxc=${KEEPASSXC:-$(nix build --no-link --print-out-paths "$repo#keepassxc^
 work=$(mktemp -d)
 shots=${KEEP:-$work/shots}
 mkdir -p "$shots"
+# Everything started below runs in its own process group (set -m), so cleanup
+# can stop all of it, including what dbus-run-session and sway start.
+set -m
 pids=()
 cleanup() {
   [[ -n ${KEEP:-} && -n ${WAYLAND_DISPLAY:-} ]] && grim "$shots/final.png" 2>/dev/null
-  for pid in "${pids[@]}"; do kill "$pid" 2>/dev/null || true; done
+  for pid in "${pids[@]}"; do kill -- "-$pid" 2>/dev/null || true; done
   wait 2>/dev/null || true
   [[ -n ${KEEP:-} ]] || rm -rf "$work"
 }
