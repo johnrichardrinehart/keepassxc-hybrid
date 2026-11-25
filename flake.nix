@@ -16,9 +16,13 @@
       overlays.default = final: prev: {
         keepassxc-hybrid = final.callPackage ./package.nix { };
         # Lets passkeys-get sign the browser's client data hash, which
-        # sign-ins through keepassxc-hybrid need.
+        # sign-ins through keepassxc-hybrid need, and lets a new passkey go to
+        # the entry selected in KeePassXC's window.
         keepassxc = prev.keepassxc.overrideAttrs (old: {
-          patches = (old.patches or [ ]) ++ [ ./patches/keepassxc-passkeys-client-data-hash.patch ];
+          patches = (old.patches or [ ]) ++ [
+            ./patches/keepassxc-passkeys-client-data-hash.patch
+            ./patches/keepassxc-passkeys-add-to-selected-entry.patch
+          ];
         });
       };
 

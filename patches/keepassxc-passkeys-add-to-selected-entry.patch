@@ -1,0 +1,303 @@
+diff --git a/src/browser/BrowserPasskeysConfirmationDialog.cpp b/src/browser/BrowserPasskeysConfirmationDialog.cpp
+index 7046a2a..a7e3a73 100644
+--- a/src/browser/BrowserPasskeysConfirmationDialog.cpp
++++ b/src/browser/BrowserPasskeysConfirmationDialog.cpp
+@@ -19,6 +19,7 @@
+ #include "ui_BrowserPasskeysConfirmationDialog.h"
+ 
+ #include "core/Entry.h"
++#include "gui/DatabaseWidget.h"
+ #include "gui/GuiTools.h"
+ #include <QCloseEvent>
+ #include <QUrl>
+@@ -57,7 +58,8 @@ void BrowserPasskeysConfirmationDialog::showEvent(QShowEvent* event)
+ void BrowserPasskeysConfirmationDialog::registerCredential(const QString& username,
+                                                            const QString& relyingParty,
+                                                            const QList<Entry*>& existingEntries,
+-                                                           int timeout)
++                                                           int timeout,
++                                                           DatabaseWidget* entrySource)
+ {
+     m_ui->firstLabel->setText(tr("Do you want to register a passkey for:"));
+     m_ui->relyingPartyLabel->setText(tr("Relying Party: %1").arg(relyingParty));
+@@ -74,8 +76,17 @@ void BrowserPasskeysConfirmationDialog::registerCredential(const QString& userna
+     } else {
+         m_ui->verticalLayout->setSizeConstraint(QLayout::SetFixedSize);
+         m_ui->confirmButton->setText(tr("Register"));
+-        m_ui->updateButton->setText(tr("Add to existing entry"));
++        m_ui->updateButton->setText(tr("Add to &selected entry"));
+         m_ui->credentialsTable->setVisible(false);
++
++        // The entry is picked in KeePassXC's own window, which stays usable meanwhile
++        m_entrySource = entrySource;
++        if (m_entrySource) {
++            setWindowModality(Qt::NonModal);
++            connect(m_entrySource, SIGNAL(entrySelectionChanged()), SLOT(updateSelectedEntry()));
++            connect(m_entrySource, SIGNAL(databaseLocked()), SLOT(updateSelectedEntry()));
++        }
++        updateSelectedEntry();
+     }
+ 
+     startCounter(timeout);
+@@ -96,6 +107,9 @@ void BrowserPasskeysConfirmationDialog::authenticateCredential(const QList<Entry
+ 
+ Entry* BrowserPasskeysConfirmationDialog::getSelectedEntry() const
+ {
++    if (m_entrySource) {
++        return m_selectedEntry.data();
++    }
+     auto selectedItem = m_ui->credentialsTable->currentItem();
+     return selectedItem ? m_entries[selectedItem->row()] : nullptr;
+ }
+@@ -111,6 +125,28 @@ void BrowserPasskeysConfirmationDialog::updatePasskey()
+     emit accept();
+ }
+ 
++void BrowserPasskeysConfirmationDialog::updateSelectedEntry()
++{
++    m_selectedEntry = m_entrySource && !m_entrySource->isLocked() ? m_entrySource->currentSelectedEntry() : nullptr;
++    m_ui->updateButton->setEnabled(!m_selectedEntry.isNull());
++    if (!m_selectedEntry) {
++        m_ui->secondLabel->setText(tr("To add the passkey to an existing entry, select the entry in KeePassXC."));
++        return;
++    }
++
++    const auto label = (m_selectedEntry->title() + " - " + m_selectedEntry->username()).toHtmlEscaped();
++    if (m_selectedEntry->hasPasskey()) {
++        // An entry holds one passkey; KeePassXC asks again before replacing it
++        m_ui->secondLabel->setText(tr("Selected entry: %1<br>It already has a passkey for %2, which would be replaced.")
++                                       .arg(label,
++                                            m_selectedEntry->attributes()
++                                                ->value(EntryAttributes::KPEX_PASSKEY_RELYING_PARTY)
++                                                .toHtmlEscaped()));
++    } else {
++        m_ui->secondLabel->setText(tr("Selected entry: %1").arg(label));
++    }
++}
++
+ void BrowserPasskeysConfirmationDialog::updateProgressBar()
+ {
+     if (m_counter < m_ui->progressBar->maximum()) {
+diff --git a/src/browser/BrowserPasskeysConfirmationDialog.h b/src/browser/BrowserPasskeysConfirmationDialog.h
+index 0f855e3..a67f4aa 100644
+--- a/src/browser/BrowserPasskeysConfirmationDialog.h
++++ b/src/browser/BrowserPasskeysConfirmationDialog.h
+@@ -19,9 +19,11 @@
+ #define KEEPASSXC_BROWSERPASSKEYSCONFIRMATIONDIALOG_H
+ 
+ #include <QDialog>
++#include <QPointer>
+ #include <QTableWidget>
+ #include <QTimer>
+ 
++class DatabaseWidget;
+ class Entry;
+ 
+ namespace Ui
+@@ -37,10 +39,13 @@ public:
+     explicit BrowserPasskeysConfirmationDialog(QWidget* parent = nullptr);
+     ~BrowserPasskeysConfirmationDialog() override;
+ 
++    // Without existing passkeys, "Add to selected entry" adds the passkey to the entry
++    // selected in entrySource, which stays usable while the dialog waits.
+     void registerCredential(const QString& username,
+                             const QString& relyingParty,
+                             const QList<Entry*>& existingEntries,
+-                            int timeout);
++                            int timeout,
++                            DatabaseWidget* entrySource = nullptr);
+     void authenticateCredential(const QList<Entry*>& entries, const QString& relyingParty, int timeout);
+     Entry* getSelectedEntry() const;
+     bool isPasskeyUpdated() const;
+@@ -52,6 +57,7 @@ private slots:
+     void updatePasskey();
+     void updateProgressBar();
+     void updateSeconds();
++    void updateSelectedEntry();
+ 
+ private:
+     void startCounter(int timeout);
+@@ -64,6 +70,8 @@ private:
+     QTimer m_timer;
+     int m_counter;
+     bool m_passkeyUpdated;
++    QPointer<DatabaseWidget> m_entrySource;
++    QPointer<Entry> m_selectedEntry;
+ };
+ 
+ #endif // KEEPASSXC_BROWSERPASSKEYSCONFIRMATIONDIALOG_H
+diff --git a/src/browser/BrowserService.cpp b/src/browser/BrowserService.cpp
+index ee94f53..7bf0b7f 100644
+--- a/src/browser/BrowserService.cpp
++++ b/src/browser/BrowserService.cpp
+@@ -666,7 +666,7 @@ QJsonObject BrowserService::showPasskeysRegisterPrompt(const QJsonObject& public
+ 
+     raiseWindow();
+     BrowserPasskeysConfirmationDialog confirmDialog(m_currentDatabaseWidget);
+-    confirmDialog.registerCredential(username, rpId, existingEntries, timeout);
++    confirmDialog.registerCredential(username, rpId, existingEntries, timeout, m_currentDatabaseWidget);
+ 
+     auto dialogResult = confirmDialog.exec();
+     if (dialogResult == QDialog::Accepted) {
+@@ -700,13 +700,18 @@ QJsonObject BrowserService::showPasskeysRegisterPrompt(const QJsonObject& public
+                     return getPasskeyError(ERROR_PASSKEYS_REQUEST_CANCELED);
+                 }
+             } else {
+-                addPasskeyToEntry(selectedEntry,
+-                                  rpId,
+-                                  rpName,
+-                                  username,
+-                                  publicKeyCredentials.credentialId,
+-                                  userId,
+-                                  publicKeyCredentials.key);
++                const auto stored = addPasskeyToEntry(selectedEntry,
++                                                      rpId,
++                                                      rpName,
++                                                      username,
++                                                      publicKeyCredentials.credentialId,
++                                                      userId,
++                                                      publicKeyCredentials.key);
++                // Otherwise the site would keep a passkey that KeePassXC never stored
++                if (!stored) {
++                    hideWindow();
++                    return getPasskeyError(ERROR_PASSKEYS_REQUEST_CANCELED);
++                }
+             }
+         } else {
+             // Handle new/existing group
+@@ -831,7 +836,7 @@ void BrowserService::addPasskeyToGroup(const QSharedPointer<Database>& db,
+     entry->removeHistoryItems(entry->historyItems());
+ }
+ 
+-void BrowserService::addPasskeyToEntry(Entry* entry,
++bool BrowserService::addPasskeyToEntry(Entry* entry,
+                                        const QString& rpId,
+                                        const QString& rpName,
+                                        const QString& username,
+@@ -844,7 +849,7 @@ void BrowserService::addPasskeyToEntry(Entry* entry,
+ 
+     Q_ASSERT(entry);
+     if (!entry) {
+-        return;
++        return false;
+     }
+ 
+     // Ask confirmation if entry already contains a Passkey
+@@ -856,7 +861,7 @@ void BrowserService::addPasskeyToEntry(Entry* entry,
+                                  MessageBox::Overwrite | MessageBox::Cancel,
+                                  MessageBox::Cancel)
+             != MessageBox::Overwrite) {
+-            return;
++            return false;
+         }
+     }
+ 
+@@ -872,6 +877,7 @@ void BrowserService::addPasskeyToEntry(Entry* entry,
+     entry->addTag(tr("Passkey"));
+ 
+     entry->endUpdate();
++    return true;
+ }
+ 
+ void BrowserService::addEntry(const EntryParameters& entryParameters,
+diff --git a/src/browser/BrowserService.h b/src/browser/BrowserService.h
+index c6efb63..3e7f564 100644
+--- a/src/browser/BrowserService.h
++++ b/src/browser/BrowserService.h
+@@ -106,7 +106,8 @@ public:
+                            const QString& credentialId,
+                            const QString& userHandle,
+                            const QString& privateKey);
+-    void addPasskeyToEntry(Entry* entry,
++    // Returns false when nothing was stored: no entry, or the user kept the entry's existing passkey
++    bool addPasskeyToEntry(Entry* entry,
+                            const QString& rpId,
+                            const QString& rpName,
+                            const QString& username,
+diff --git a/src/gui/passkeys/PasskeyImporter.cpp b/src/gui/passkeys/PasskeyImporter.cpp
+index f557517..2608630 100644
+--- a/src/gui/passkeys/PasskeyImporter.cpp
++++ b/src/gui/passkeys/PasskeyImporter.cpp
+@@ -120,25 +120,20 @@ bool PasskeyImporter::showImportDialog(QSharedPointer<Database>& database,
+ 
+     // Store to entry if given directly
+     if (entry) {
+-        browserService()->addPasskeyToEntry(
++        return browserService()->addPasskeyToEntry(
+             entry, relyingParty, relyingParty, username, credentialId, userHandle, privateKey);
+-        return true;
+     }
+ 
+     // Import to entry selected instead of creating a new one
+     if (!passkeyImportDialog.createNewEntry()) {
+         auto groupUuid = passkeyImportDialog.getSelectedGroupUuid();
+         auto group = db->rootGroup()->findGroupByUuid(groupUuid);
++        auto selectedEntry = group ? group->findEntryByUuid(passkeyImportDialog.getSelectedEntryUuid()) : nullptr;
+ 
+-        if (group) {
+-            auto selectedEntry = group->findEntryByUuid(passkeyImportDialog.getSelectedEntryUuid());
+-            if (selectedEntry) {
+-                browserService()->addPasskeyToEntry(
+-                    selectedEntry, relyingParty, relyingParty, username, credentialId, userHandle, privateKey);
+-            }
+-        }
+-
+-        return true;
++        // False when nothing was stored, so the caller does not report success
++        return selectedEntry
++               && browserService()->addPasskeyToEntry(
++                   selectedEntry, relyingParty, relyingParty, username, credentialId, userHandle, privateKey);
+     }
+ 
+     // Group settings. Use default group "Imported Passkeys" if user did not select a specific one.
+diff --git a/tests/TestPasskeys.cpp b/tests/TestPasskeys.cpp
+index 51ff530..eaac5be 100644
+--- a/tests/TestPasskeys.cpp
++++ b/tests/TestPasskeys.cpp
+@@ -25,6 +25,7 @@
+ #include "core/Entry.h"
+ #include "core/Group.h"
+ #include "crypto/Crypto.h"
++#include "gui/MessageBox.h"
+ 
+ #include <QJsonArray>
+ #include <QJsonDocument>
+@@ -541,6 +542,26 @@ void TestPasskeys::testEntry()
+     QVERIFY(entry->hasPasskey());
+ }
+ 
++void TestPasskeys::testAddPasskeyToEntryWithPasskey()
++{
++    Database db;
++    auto* entry = new Entry();
++    entry->setGroup(db.rootGroup());
++    QVERIFY(browserService()->addPasskeyToEntry(
++        entry, "example.com", "example.com", "first", "firstId", "firstHandle", "firstKey"));
++
++    // Keeping the existing passkey stores nothing and says so
++    MessageBox::setNextAnswer(MessageBox::Cancel);
++    QVERIFY(!browserService()->addPasskeyToEntry(
++        entry, "example.org", "example.org", "second", "secondId", "secondHandle", "secondKey"));
++    QCOMPARE(entry->attributes()->value(EntryAttributes::KPEX_PASSKEY_RELYING_PARTY), QString("example.com"));
++
++    MessageBox::setNextAnswer(MessageBox::Overwrite);
++    QVERIFY(browserService()->addPasskeyToEntry(
++        entry, "example.org", "example.org", "second", "secondId", "secondHandle", "secondKey"));
++    QCOMPARE(entry->attributes()->value(EntryAttributes::KPEX_PASSKEY_RELYING_PARTY), QString("example.org"));
++}
++
+ void TestPasskeys::testIsDomain()
+ {
+     QVERIFY(passkeyUtils()->isDomain("test.example.com"));
+diff --git a/tests/TestPasskeys.h b/tests/TestPasskeys.h
+index b1c8dbc..94fc85c 100644
+--- a/tests/TestPasskeys.h
++++ b/tests/TestPasskeys.h
+@@ -45,6 +45,7 @@ private slots:
+     void testSetFlags();
+ 
+     void testEntry();
++    void testAddPasskeyToEntryWithPasskey();
+     void testIsDomain();
+     void testRegistrableDomainSuffix();
+     void testRpIdValidation();

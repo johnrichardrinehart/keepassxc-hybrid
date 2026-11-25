@@ -37,6 +37,10 @@ unset WAYLAND_DISPLAY DISPLAY SWAYSOCK DBUS_SESSION_BUS_ADDRESS
 password=live-test
 printf '%s\n%s\n' "$password" "$password" |
   "$keepassxc/keepassxc-cli" db-create --set-password "$work/test.kdbx" >/dev/null 2>&1
+# The entry the registration adds its passkey to.
+entry="Example account"
+echo "$password" | "$keepassxc/keepassxc-cli" add -q -u alice --url https://example.com \
+  "$work/test.kdbx" "$entry"
 
 cat >"$work/keepassxc.ini" <<EOF
 [General]
@@ -82,12 +86,11 @@ unlocked || { cat "$work/keepassxc.log"; echo "KeePassXC did not unlock the data
 # focus (keys sent earlier land on another widget), with a single wtype call
 # (Qt deactivates the window when a call's virtual keyboard goes away). The
 # example asks for an association, a registration, then an authentication.
-# Registration takes "Add to existing entry" (two Tabs from Cancel), then
-# Register in the entry picker (four Tabs from its Group box), which creates
-# a new entry; authentication takes Authenticate (three Tabs from the
-# credentials table).
+# Registration selects the entry in the main window (search, then Down to the
+# first result) and takes "Add to selected entry" (Alt+S); authentication
+# takes Authenticate (three Tabs from the credentials table).
 answer_dialogs() {
-  local passkey_dialogs=0 seen=" " id title
+  local passkey_dialogs=0 seen=" " id title main
   while sleep 0.5; do
     read -r id title < <(focused)
     [[ $seen == *" $id "* ]] && continue
@@ -99,14 +102,33 @@ answer_dialogs() {
       *"Passkey"*)
         sleep 1.5
         passkey_dialogs=$((passkey_dialogs + 1))
-        grim "$shots/passkey-$passkey_dialogs.png"
-        case $passkey_dialogs in
-          1) wtype -k Tab -k Tab -k Return ;;
-          2) wtype -k Tab -k Tab -k Tab -k Tab -k Return ;;
-          *) wtype -k Tab -k Tab -k Tab -k Space ;;
-        esac ;;
+        if ((passkey_dialogs == 1)); then
+          main=$(swaymsg -t get_tree | jq -r '.. | objects | select(.name == "test.kdbx - KeePassXC") | .id')
+          swaymsg -q "[con_id=$main] focus"
+          sleep 0.5
+          wtype -M ctrl -k f -m ctrl alice -k Down
+          sleep 0.5
+          swaymsg -q "[con_id=$id] focus"
+          sleep 1
+          grim "$shots/passkey-$passkey_dialogs.png"
+          wtype -M alt -k s -m alt
+        else
+          # The main window had focus last; give it back to the dialog.
+          swaymsg -q "[con_id=$id] focus"
+          sleep 1
+          grim "$shots/passkey-$passkey_dialogs.png"
+          wtype -k Tab -k Tab -k Tab -k Space
+        fi ;;
       *) continue ;;
     esac
+    # Keys sometimes reach the dialog while it is inactive and do nothing;
+    # answer it again if it is still open.
+    sleep 2
+    if swaymsg -t get_tree | jq -e ".. | objects | select(.id == $id)" >/dev/null; then
+      [[ $title == *Passkey* ]] && passkey_dialogs=$((passkey_dialogs - 1))
+      echo "retrying: $title" >&2
+      continue
+    fi
     seen+="$id "
     echo "answered: $title" >&2
   done
@@ -115,3 +137,9 @@ answer_dialogs &
 pids+=($!)
 
 timeout 60 "$example" "$work/associations.json"
+
+# The passkey went into the selected entry (KeePassXC saves after each change).
+relying_party=$(echo "$password" | "$keepassxc/keepassxc-cli" show -q -a KPEX_PASSKEY_RELYING_PARTY \
+  "$work/test.kdbx" "$entry")
+[[ $relying_party == example.com ]] || { echo "the passkey is not in \"$entry\"" >&2; exit 1; }
+echo "passkey stored in \"$entry\""

@@ -54,6 +54,16 @@ does when you connect it. Give it a name; the approval is stored in
   `passkeys-get`. Without it the tool refuses to send the signature.
   Registering works on stock KeePassXC, because KeePassXC uses `none`
   attestation: nothing it returns at registration depends on the client data.
+- **Optional:
+  [`patches/keepassxc-passkeys-add-to-selected-entry.patch`](patches/keepassxc-passkeys-add-to-selected-entry.patch).**
+  Stock KeePassXC picks the existing entry for a new passkey from Group and
+  Entry drop-downs. With the patch, the registration dialog's "Add to selected
+  entry" takes the entry selected in KeePassXC's main window, which stays
+  usable (search, tree) while the dialog waits, and says when that entry
+  already has a passkey (an entry holds one). Declining to replace an entry's
+  passkey now cancels the registration; stock KeePassXC reports success to
+  the site for a passkey it never stored. Both apply to passkeys registered
+  through KeePassXC-Browser too.
 - **A Bluetooth LE adapter that can advertise**, through BlueZ.
 - **The browser on another device, or a second Bluetooth adapter.** A browser
   scans for the advertisement before it uses the relay, and a Bluetooth
