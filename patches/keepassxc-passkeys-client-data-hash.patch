@@ -1,0 +1,143 @@
+diff --git a/src/browser/BrowserPasskeys.cpp b/src/browser/BrowserPasskeys.cpp
+index 2ea8140..5aededc 100644
+--- a/src/browser/BrowserPasskeys.cpp
++++ b/src/browser/BrowserPasskeys.cpp
+@@ -138,14 +138,23 @@ QJsonObject BrowserPasskeys::buildGetPublicKeyCredential(const QJsonObject& asse
+     const auto clientDataJson = assertionOptions["clientDataJson"].toString();
+     const auto clientDataArray = clientDataJson.toUtf8();
+ 
+-    const auto signature = buildSignature(authenticatorData, clientDataArray, privateKeyPem);
++    // A hybrid (caBLE) authenticator gets only the hash of the client data the platform built
++    const auto hasClientDataHash = assertionOptions.contains("clientDataHash");
++    const auto clientDataHash =
++        hasClientDataHash ? browserMessageBuilder()->getArrayFromBase64(assertionOptions["clientDataHash"].toString())
++                          : browserMessageBuilder()->getSha256Hash(clientDataArray);
++
++    const auto signature = buildSignatureFromHash(authenticatorData, clientDataHash, privateKeyPem);
+     if (signature.isEmpty()) {
+         return {};
+     }
+ 
+     QJsonObject responseObject;
+     responseObject["authenticatorData"] = browserMessageBuilder()->getBase64FromArray(authenticatorData);
+-    responseObject["clientDataJSON"] = browserMessageBuilder()->getBase64FromArray(clientDataArray);
++    // With a supplied hash, KeePassXC's own client data is not what was signed
++    if (!hasClientDataHash) {
++        responseObject["clientDataJSON"] = browserMessageBuilder()->getBase64FromArray(clientDataArray);
++    }
+     responseObject["clientExtensionResults"] = assertionOptions["clientExtensionResults"];
+     responseObject["signature"] = browserMessageBuilder()->getBase64FromArray(signature);
+     responseObject["userHandle"] = userHandle;
+@@ -337,7 +346,14 @@ QByteArray BrowserPasskeys::buildSignature(const QByteArray& authenticatorData,
+                                            const QByteArray& clientData,
+                                            const QString& privateKeyPem)
+ {
+-    const auto clientDataHash = browserMessageBuilder()->getSha256Hash(clientData);
++    return buildSignatureFromHash(
++        authenticatorData, browserMessageBuilder()->getSha256Hash(clientData), privateKeyPem);
++}
++
++QByteArray BrowserPasskeys::buildSignatureFromHash(const QByteArray& authenticatorData,
++                                                   const QByteArray& clientDataHash,
++                                                   const QString& privateKeyPem)
++{
+     const auto attToBeSigned = authenticatorData + clientDataHash;
+ 
+     try {
+diff --git a/src/browser/BrowserPasskeys.h b/src/browser/BrowserPasskeys.h
+index 83ba625..0baf917 100644
+--- a/src/browser/BrowserPasskeys.h
++++ b/src/browser/BrowserPasskeys.h
+@@ -124,6 +124,9 @@ private:
+     AttestationKeyPair buildCredentialPrivateKey(int alg, const TestingVariables& testingVariables = {});
+     QByteArray
+     buildSignature(const QByteArray& authenticatorData, const QByteArray& clientData, const QString& privateKeyPem);
++    QByteArray buildSignatureFromHash(const QByteArray& authenticatorData,
++                                      const QByteArray& clientDataHash,
++                                      const QString& privateKeyPem);
+     QJsonObject parseAuthData(const QByteArray& authData) const;
+     QJsonObject parseFlags(const QByteArray& flags) const;
+     char setFlagsFromJson(const QJsonObject& flags) const;
+diff --git a/src/browser/BrowserPasskeysClient.cpp b/src/browser/BrowserPasskeysClient.cpp
+index 64857a7..5b1e098 100644
+--- a/src/browser/BrowserPasskeysClient.cpp
++++ b/src/browser/BrowserPasskeysClient.cpp
+@@ -164,6 +164,17 @@ int BrowserPasskeysClient::getAssertionOptions(const QJsonObject& publicKeyOptio
+     QJsonObject assertionOptions;
+     assertionOptions["allowCredentials"] = publicKeyOptions["allowCredentials"];
+     assertionOptions["clientDataJson"] = clientDataJson;
++
++    // Set by clients that relay a request whose client data was built elsewhere (hybrid transport)
++    if (publicKeyOptions.contains("clientDataHash")) {
++        constexpr int sha256Length = 32;
++        const auto clientDataHash = publicKeyOptions["clientDataHash"].toString();
++        if (browserMessageBuilder()->getArrayFromBase64(clientDataHash).length() != sha256Length) {
++            return ERROR_PASSKEYS_INVALID_CHALLENGE;
++        }
++        assertionOptions["clientDataHash"] = clientDataHash;
++    }
++
+     assertionOptions["clientExtensionResults"] = extensionData.extensionObject;
+     assertionOptions["extensions"] = extensions;
+     assertionOptions["rpId"] = rpId;
+diff --git a/tests/TestPasskeys.cpp b/tests/TestPasskeys.cpp
+index 51ff530..1a718fa 100644
+--- a/tests/TestPasskeys.cpp
++++ b/tests/TestPasskeys.cpp
+@@ -705,3 +705,45 @@ void TestPasskeys::testAllowLocalhostWithPasskeys()
+     QVERIFY(!passkeyUtils()->isOriginAllowedWithLocalhost(false, "http://test.localhost"));
+     QVERIFY(!passkeyUtils()->isOriginAllowedWithLocalhost(true, "http://localhost.example.com"));
+ }
++
++void TestPasskeys::testGetWithClientDataHash()
++{
++    // RSA PKCS#1 v1.5 signatures are deterministic: two signatures over the same data are equal
++    const auto privateKeyPem =
++        QString(browserPasskeys()->buildCredentialPrivateKey(WebAuthnAlgorithms::RS256).privateKeyPem);
++    QVERIFY(!privateKeyPem.isEmpty());
++    const auto origin = QString("https://webauthn.io");
++    const auto id = QString("yrzFJ5lwcpTwYMOdXSmxF5b5cYQlqBMzbbU_d-oFLO8");
++    const auto requestOptions = browserMessageBuilder()->getJsonObject(PublicKeyCredentialRequestOptions.toUtf8());
++
++    // The client data a platform (browser) builds and signs over
++    QJsonObject platformOptions;
++    QCOMPARE(browserPasskeysClient()->getAssertionOptions(requestOptions, origin, &platformOptions), 0);
++    const auto platformCredential =
++        browserPasskeys()->buildGetPublicKeyCredential(platformOptions, id, {}, privateKeyPem);
++    const auto platformResponse = platformCredential["response"].toObject();
++    const auto platformClientData =
++        browserMessageBuilder()->getArrayFromBase64(platformResponse["clientDataJSON"].toString());
++    QVERIFY(!platformClientData.isEmpty());
++
++    // A hybrid (caBLE) request carries only that client data's hash, and a placeholder challenge
++    auto hybridRequest = requestOptions;
++    hybridRequest["challenge"] = QString("AAAAAAAAAAAAAAAAAAAAAA");
++    hybridRequest["clientDataHash"] =
++        browserMessageBuilder()->getBase64FromArray(browserMessageBuilder()->getSha256Hash(platformClientData));
++    QJsonObject hybridOptions;
++    QCOMPARE(browserPasskeysClient()->getAssertionOptions(hybridRequest, origin, &hybridOptions), 0);
++    const auto hybridCredential = browserPasskeys()->buildGetPublicKeyCredential(hybridOptions, id, {}, privateKeyPem);
++    const auto hybridResponse = hybridCredential["response"].toObject();
++
++    QCOMPARE(hybridResponse["signature"].toString(), platformResponse["signature"].toString());
++    QCOMPARE(hybridResponse["authenticatorData"].toString(), platformResponse["authenticatorData"].toString());
++    // KeePassXC's own client data was not signed, so it is not returned
++    QVERIFY(!hybridResponse.contains("clientDataJSON"));
++
++    // A hash of the wrong length is rejected
++    hybridRequest["clientDataHash"] = QString("AAAA");
++    QJsonObject rejectedOptions;
++    QCOMPARE(browserPasskeysClient()->getAssertionOptions(hybridRequest, origin, &rejectedOptions),
++             static_cast<int>(ERROR_PASSKEYS_INVALID_CHALLENGE));
++}
+diff --git a/tests/TestPasskeys.h b/tests/TestPasskeys.h
+index b1c8dbc..8d96733 100644
+--- a/tests/TestPasskeys.h
++++ b/tests/TestPasskeys.h
+@@ -54,5 +54,6 @@ private slots:
+     void testIsResidentKeyRequired();
+     void testIsUserVerificationRequired();
+     void testAllowLocalhostWithPasskeys();
++    void testGetWithClientDataHash();
+ };
+ #endif // KEEPASSXC_TESTPASSKEYS_H
